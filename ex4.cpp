@@ -128,8 +128,8 @@ struct BBL_Data {
 struct BBLEntry {
     ADDRINT bblAddr = 0;
     UINT64 execCount = 0;
-    UINT64 takenCount = 0;
-    UINT64 fallthroughCount = 0;
+    INT64 takenCount = 0;
+    INT64 fallthroughCount = 0;
     bool isConditionalJump = false;
     ADDRINT targetAddr[4] = {0};
     UINT64 targetCount[4] = {0};
@@ -138,6 +138,9 @@ struct BBLEntry {
 #define MAX_BBL_NUM 10000
 UINT64 BBL_Counts[MAX_BBL_NUM] = {0};
 ADDRINT BBL_Addresses[MAX_BBL_NUM] = {0}; 
+
+UINT64 (*BBL_TargetAddr)[4] = nullptr;
+UINT64 (*BBL_TargetCount)[4] = nullptr;
 
 BBLEntry bbl_data[MAX_BBL_NUM];
 unsigned bbl_num = 0;
@@ -822,6 +825,42 @@ int check_and_insert_instr(xed_encoder_instruction_t enc_instr, INS ins) {
     return 0;
 }
 
+int add_prof_instr(ADDRINT addr, xed_encoder_instruction_t *enc_instr)
+{
+   xed_encoder_request_t enc_req;
+   xed_decoded_inst_t xedd;
+   xed_error_enum_t xed_code;
+   char encoded_ins[XED_MAX_INSTRUCTION_BYTES];
+   unsigned int ilen = XED_MAX_INSTRUCTION_BYTES;
+   unsigned int olen = 0;
+
+   xed_encoder_request_zero_set_mode(&enc_req, &dstate);
+   xed_bool_t convert_ok = xed_convert_to_encoder_request(&enc_req, enc_instr);
+   if (!convert_ok) {
+       cerr << "conversion to encode request failed" << endl;
+       return -1;
+   }
+   xed_error_enum_t xed_error = xed_encode(&enc_req,
+             reinterpret_cast<UINT8*>(encoded_ins), ilen, &olen);
+   if (xed_error != XED_ERROR_NONE) {
+       cerr << "ENCODE ERROR: " << xed_error_enum_t2str(xed_error) << endl;
+     return -1;
+   }
+   xed_decoded_inst_zero_set_mode(&xedd,&dstate);
+   xed_code = xed_decode(&xedd, reinterpret_cast<UINT8*>(&encoded_ins), max_inst_len);
+   if (xed_code != XED_ERROR_NONE) {
+       cerr << "ERROR: xed decode failed for instr at: " << "0x" << hex << addr << endl;
+       return -1;;
+   }
+   int rc = add_new_instr_entry(&xedd, 0x0, olen, false);
+   if (rc < 0) {
+     cerr << "ERROR: failed during instructon translation." << endl;
+     return -1;
+   }
+
+   return 0;
+}
+
 // insert instructions to add num to mem
 int insert_add_to_mem(ADDRINT mem, int num, INS ins) {
     xed_encoder_instruction_t enc_instr;
@@ -861,6 +900,200 @@ int insert_add_to_mem(ADDRINT mem, int num, INS ins) {
     ret = check_and_insert_instr(enc_instr, ins);
     if (ret < 0) { return ret; }
     
+    return 0;
+}
+
+int indirect_jumps_handle(INS ins, uint64_t* rax_mem) {
+    ADDRINT ins_addr = INS_Address(ins);
+    xed_encoder_instruction_t enc_instr;
+    if (INS_IsIndirectControlFlow(ins) && !INS_IsRet(ins) && !INS_IsCall(ins)) {
+        bbl_data[bbl_num].isConditionalJump = true;
+        // Debug print.
+        //cerr << " BBL terminates with indirect jump: " << INS_Disassemble(ins) << "\n";
+        
+        static uint64_t rbx_mem, rcx_mem;
+        #define MAX_TARG_ADDRS 3
+        static uint64_t bb_map_targ_addr[MAX_BBL_NUM][MAX_TARG_ADDRS + 1];
+        static uint64_t bb_map_targ_count[MAX_BBL_NUM][MAX_TARG_ADDRS + 1];
+        BBL_TargetAddr = bb_map_targ_addr;
+        BBL_TargetCount = bb_map_targ_count;
+        
+        // Retrieve the details about the mem operand.
+        xed_decoded_inst_t *xedd = INS_XedDec(ins);
+        xed_reg_enum_t base_reg = xed_decoded_inst_get_base_reg(xedd, 0);
+        xed_reg_enum_t index_reg = xed_decoded_inst_get_index_reg(xedd, 0);
+        xed_int64_t disp = xed_decoded_inst_get_memory_displacement(xedd, 0);
+        xed_uint_t scale = xed_decoded_inst_get_scale(xedd, 0);
+        xed_uint_t width = xed_decoded_inst_get_memory_displacement_width_bits(xedd, 0);
+        unsigned mem_addr_width = xed_decoded_inst_get_memop_address_width(xedd, 0);
+        
+        xed_reg_enum_t targ_reg = XED_REG_INVALID;
+        unsigned memops = xed_decoded_inst_number_of_memory_operands(xedd);
+        if (!memops)
+            targ_reg = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+        
+        // Save RBX step 1 - MOV RBX into RAX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RAX),  // Destination op.
+                    xed_reg(XED_REG_RBX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Save RBX step 2 - MOV RAX into rbx_mem
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rbx_mem, 64), 64), // Destination op.
+                    xed_reg(XED_REG_RAX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Save RCX step 1 - MOV RCX into RAX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RAX),   // Destination op.
+                    xed_reg(XED_REG_RCX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Save RCX step 2 - MOV RAX into rcx_mem
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rcx_mem, 64), 64), // Destination op.
+                    xed_reg(XED_REG_RAX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Replace RIP reg by a full displacement.
+        // Convert 'jmp [rax*8+0x657118]' or 'jmp [rip+0x42513c]'
+        // to: mov rax, [rax*8+0x657118] or: mov rax, [<absolute addr>]
+        //
+        // Check if we need to restore RAX in case  it is used as base reg or index reg,
+        // e.g., jmp [RIP+8*RAX] or: jmp [RAX+8*RBX]
+        
+        // Check if we need to restore RAX from rax_mem
+        if (targ_reg == XED_REG_RAX || base_reg == XED_REG_RAX || index_reg == XED_REG_RAX) {
+            xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RAX), // Destination reg op.
+                    xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)rax_mem, 64), 64));
+            if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        }
+        // Check if we need to convert [RIP+disp+index*scale] to [absolute_disp + index*scale]
+        if (base_reg == XED_REG_RIP) {
+            unsigned int orig_size = xed_decoded_inst_get_length (xedd);
+            // Modify rip displacement by an absolute displacement val.
+            xed_int64_t new_disp = ins_addr + disp + orig_size;
+            xed_int64_t new_disp_width = 32; // set maximal disp width for now.
+            xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RAX),    // Destination reg op.
+                    xed_mem_bisd(XED_REG_INVALID, index_reg, scale, 
+                                    xed_disp(new_disp, new_disp_width),
+                                    mem_addr_width));
+        } else if (targ_reg != XED_REG_RAX) { // avoid ceating MOV RAX, RAX Nop.
+            xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                        xed_reg(XED_REG_RAX),    // Destination reg op.
+                        (targ_reg != XED_REG_INVALID ? xed_reg(targ_reg) :
+                        xed_mem_bisd(base_reg, index_reg, scale, xed_disp(disp, width), mem_addr_width)));
+        }
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // MOV RBX, RAX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RBX),    // Destination reg op.
+                    xed_reg(XED_REG_RAX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // AND RAX, MAX_TARG_ADDRS.
+        // NOTE: Modifies RFLAGS.
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_AND, 64,
+                    xed_reg(XED_REG_RAX),    // Destination reg op.
+                    xed_imm0(MAX_TARG_ADDRS, 8));  // keep only MAX_TARG_ADDRS+1 targets for profiling.
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // MOV RCX, xed_imm0((ADDRINT)&bbl_map[bbl_num].targ_addr[0])
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RCX), // Destination reg op.
+                    xed_imm0((ADDRINT)&(bb_map_targ_addr[bbl_num][0]), 64));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // MOV [RCX + 8*RAX], RBX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_mem_bisd(XED_REG_RCX, // base reg
+                                XED_REG_RAX, //index reg
+                                8, // scale
+                                xed_disp(0, 32), // disp
+                                64),  // Destination reg op.
+                    xed_reg(XED_REG_RBX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // MOV RBX, xed_imm0((ADDRINT)&bbl_map[bbl_num].targ_count[0])
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RBX), // Destination reg op.
+                    xed_imm0((ADDRINT)&(bb_map_targ_count[bbl_num][0]), 64));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // MOV RCX, [RBX + 8*RAX]
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RCX),   // Destination reg op.
+                    xed_mem_bisd(XED_REG_RBX, // base reg
+                                XED_REG_RAX, //index reg
+                                8, // scale
+                                xed_disp(0, 32), // disp
+                                64));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // LEA RCX, [RCX + 1]
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_LEA, 64,
+                    xed_reg(XED_REG_RCX), // Destination reg op.
+                    xed_mem_bd(XED_REG_RCX, // base reg
+                                xed_disp(1, 8), // disp
+                                64));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // MOV [RBX + 8*RAX], RCX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_mem_bisd(XED_REG_RBX, // base reg
+                                XED_REG_RAX, //index reg
+                                8, // scale
+                                xed_disp(0, 32), // disp
+                                64),     // Destination op.
+                    xed_reg(XED_REG_RCX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Restore RCX step 1- MOV from rcx_mem into RAX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RAX), // Destination op.
+                    xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rcx_mem, 64), 64));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Restore RCX step 2 - MOV RAX into RCX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RCX),  // Destination op.
+                    xed_reg(XED_REG_RAX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Restore RBX step 1 - MOV from rbx_mem into RAX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RAX), // Destination op.
+                    xed_mem_bd(XED_REG_INVALID, xed_disp((ADDRINT)&rbx_mem, 64), 64));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+        
+        // Restore RBX step 2 - MOV RAX into RBX
+        xed_inst2(&enc_instr, dstate, XED_ICLASS_MOV, 64,
+                    xed_reg(XED_REG_RBX),  // Destination op.
+                    xed_reg(XED_REG_RAX));
+        if (add_prof_instr(ins_addr, &enc_instr) < 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -908,7 +1141,7 @@ int find_candidate_rtns_for_translation(IMG img) {
                     // (ins)), INS_Size(ins));
                 }
 
-                ADDRINT addr = INS_Address(ins);
+                ADDRINT ins_addr = INS_Address(ins);
 
                 xed_decoded_inst_t xedd;
                 xed_error_enum_t xed_code;
@@ -920,9 +1153,8 @@ int find_candidate_rtns_for_translation(IMG img) {
                 // instruction.
                 //
                 bool isInsTerminatesBBL =
-                    (INS_IsIndirectControlFlow(ins) ||
-                     INS_IsDirectControlFlow(ins) || INS_IsRet(ins)) &&
-                    !INS_IsCall(ins);
+                    (INS_IsDirectControlFlow(ins) || INS_IsIndirectControlFlow(ins)) &&
+                   !INS_IsCall(ins);
                 
 
                 if (isInsTerminatesBBL) {
@@ -933,15 +1165,17 @@ int find_candidate_rtns_for_translation(IMG img) {
                         xed_disp((ADDRINT)&rax_mem, 64), 64),
                         xed_reg(XED_REG_RAX)
                     );
-                    ret = check_and_insert_instr(enc_instr, ins);
-                    if (ret < 0) { return ret; }
+                    if (check_and_insert_instr(enc_instr, ins) < 0) { return ret; }
+
+                    // Create profiling for indirect jump targets.
+                    if (indirect_jumps_handle(ins, &rax_mem) < 0) {
+                        return -1;
+                    }
 
                     if (INS_IsBranch(ins)) {
-                        bbl_data[bbl_num].isConditionalJump = true;
                         ret = insert_add_to_mem((ADDRINT)&bbl_data[bbl_num].takenCount, 1, ins);
                         if (ret < 0) { return ret; }
                     }
-    
                     ret = insert_add_to_mem((ADDRINT)&bbl_data[bbl_num].execCount, 1, ins);
                     if (ret < 0) { return ret; }
                     
@@ -952,23 +1186,22 @@ int find_candidate_rtns_for_translation(IMG img) {
                             XED_REG_INVALID,
                             xed_disp((ADDRINT)&rax_mem, 64), 64));
 
-                    ret = check_and_insert_instr(enc_instr, ins);
-                    if (ret < 0) { return ret; }
+                    if (check_and_insert_instr(enc_instr, ins) < 0) { return ret; }
 
                     BBL_Addresses[bbl_num] = lastBBLStart;
                 }
                 xed_decoded_inst_zero_set_mode(&xedd, &dstate);
-                xed_code = xed_decode(&xedd, reinterpret_cast<UINT8 *>(addr),
+                xed_code = xed_decode(&xedd, reinterpret_cast<UINT8 *>(ins_addr),
                                       max_inst_len);
                 if (xed_code != XED_ERROR_NONE) {
                     cerr << "ERROR: xed decode failed for "
                             "instr at: "
-                         << "0x" << hex << addr << endl;
+                         << "0x" << hex << ins_addr << endl;
                     return -1;
                 }
 
                 // Add instr into instr map:
-                bool isRtnHead = (RTN_Address(rtn) == addr);
+                bool isRtnHead = (RTN_Address(rtn) == ins_addr);
                 rc = add_new_instr_entry(&xedd, INS_Address(ins), INS_Size(ins),
                                          isRtnHead);
                 if (rc < 0) {
@@ -988,8 +1221,7 @@ int find_candidate_rtns_for_translation(IMG img) {
                             xed_disp((ADDRINT)&rax_mem, 64), 64),
                             xed_reg(XED_REG_RAX)
                         );
-                        ret = check_and_insert_instr(enc_instr, ins);
-                        if (ret < 0) { return ret; }
+                        if (check_and_insert_instr(enc_instr, ins) < 0) { return ret; }
 
                         ret = insert_add_to_mem((ADDRINT)&bbl_data[bbl_num].takenCount, -1, ins);
                         if (ret < 0) { return ret; }
@@ -1003,8 +1235,7 @@ int find_candidate_rtns_for_translation(IMG img) {
                                 XED_REG_INVALID,
                                 xed_disp((ADDRINT)&rax_mem, 64), 64));
 
-                        ret = check_and_insert_instr(enc_instr, ins);
-                        if (ret < 0) { return ret; }
+                        if (check_and_insert_instr(enc_instr, ins) < 0) { return ret; }
                     }
                 }
 
@@ -1120,7 +1351,7 @@ int allocate_and_init_memory(IMG img) {
     }
 
     max_ins_count *=
-        10; // estimating that the num of instrs of the inlined functions
+        20; // estimating that the num of instrs of the inlined functions
             // will not exceed the total nunmber of the entire code.
 
     // Allocate memory for the instr map needed to fix all branch targets in
@@ -1174,6 +1405,21 @@ VOID Fini(INT32 code, VOID *v) {
     for (int i = 0; i < MAX_BBL_NUM; i++) {
         // bbl_data[i].execCount = BBL_Counts[i];
         bbl_data[i].bblAddr = BBL_Addresses[i];
+        if (BBL_TargetAddr && BBL_TargetCount) {
+            for (int j = 0; j < 4; j++) {  
+                if (BBL_TargetAddr[i][j] != 0) {
+                    cout << "writing to bbl data" << BBL_TargetAddr[i][j] << endl;
+                }
+                if (bbl_data[i].takenCount < 0) {
+                    bbl_data[i].takenCount = 0;
+                }
+                if (bbl_data[i].fallthroughCount < 0) {
+                    bbl_data[i].fallthroughCount = 0;
+                }
+                bbl_data[i].targetAddr[j] = BBL_TargetAddr[i][j];
+                bbl_data[i].targetCount[j] = BBL_TargetCount[i][j];
+            }
+        }
     }
 
     std::sort(std::begin(bbl_data), std::end(bbl_data), compByAddr);
@@ -1185,9 +1431,9 @@ VOID Fini(INT32 code, VOID *v) {
             << bbl_data[i].fallthroughCount;
 
             if (bbl_data[i].isConditionalJump) {
-                for (int i = 0; i < 4; i++) {
-                    file << ", " << bbl_data[i].targetAddr[i] << ":"
-                    << bbl_data[i].targetAddr[i];
+                for (int j = 0; j < 4; j++) {
+                    file << ", " << bbl_data[i].targetAddr[j] << ":"
+                    << bbl_data[i].targetCount[j];
                 }
             }
             file << endl;
